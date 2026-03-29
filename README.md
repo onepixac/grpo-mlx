@@ -22,18 +22,28 @@ Now Mac users can run the full fine-tuning pipeline locally:
 
 Based on: *"Shaping Explanations: Semantic Reward Modeling with Encoder-Only Transformers for GRPO"* ([arXiv:2509.13081](https://arxiv.org/abs/2509.13081))
 
-## How It Works
+## Architecture: Generator-Evaluator Pattern
+
+This follows the same pattern described in [Anthropic's harness design research](https://www.anthropic.com/engineering/harness-design): separate the agent doing the work (generator) from the agent judging it (evaluator).
+
+- **Generator**: the LLM producing candidate responses via sampling
+- **Evaluator**: an independent sentence-transformer encoder scoring candidates on multiple criteria
+
+The generator cannot reliably judge its own output quality — an independent evaluator with concrete, weighted criteria produces better signal. The evaluator scores each candidate on three criteria (semantic similarity, response length, brevity), and the generator adapts its exploration strategy based on reward trends.
 
 ```
 For each training iteration:
   1. Sample prompts from your dataset
-  2. Generate N candidate responses per prompt (with sampling for diversity)
-  3. Score each candidate with semantic similarity (sentence-transformers)
-     → cosine similarity between candidate and reference response
+  2. Generate N candidate responses (temperature adapts: explore when stuck, exploit when improving)
+  3. Evaluate each candidate on multiple weighted criteria:
+     - Semantic similarity to reference (default weight: 0.7)
+     - Response length adequacy (default weight: 0.2)
+     - Brevity match to reference (default weight: 0.1)
   4. Compute GRPO loss: reward-weighted cross-entropy
      - Candidates above group average → reinforce (make more likely)
      - Candidates below group average → penalize (make less likely)
   5. Backpropagate through MLX and update LoRA weights
+  6. Adapt temperature based on reward trend (pivot vs refine)
 ```
 
 The key insight: `mlx.nn.value_and_grad` computes both loss and gradients in a single call, making GRPO feasible on MLX without any external RL framework.
@@ -114,8 +124,9 @@ SUCCESS: final reward 0.891
 | `--max-tokens` | 256 | Max response tokens |
 | `--lr` | 1e-6 | Learning rate (keep low for RL stability) |
 | `--lora-layers` | 16 | Number of LoRA layers |
-| `--temperature` | 0.7 | Generation temperature |
+| `--temperature` | 0.7 | Base generation temperature (adapts automatically) |
 | `--min-response-length` | 80 | Min chars in reference response |
+| `--reward-weights` | "0.7,0.2,0.1" | Weights for semantic,length,brevity criteria |
 | `--log` | None | Log file path |
 
 ## Hardware Guidelines (4-bit quantized models)
@@ -156,9 +167,30 @@ python grpo_mlx.py --model ... --adapter sft_adapters ...   # Stage 3: GRPO
 
 If your model has a "thinking mode" (e.g. Qwen3.5, QwQ, or similar reasoning models), **you must disable it**. The script handles this via `enable_thinking=False` in `apply_chat_template`. Thinking models prepend internal reasoning to every response, which destroys semantic similarity scores. In our tests: reward 0.92 without thinking, 0.27 with thinking.
 
-### Semantic Reward
+### Multi-Criteria Reward
 
-The reward signal comes from cosine similarity between generated and reference responses, computed by a lightweight sentence-transformer encoder (~80MB, runs on CPU). This is more flexible than keyword matching and orders of magnitude cheaper than using an LLM judge.
+Instead of a single similarity score, the evaluator grades candidates on three independent criteria:
+
+| Criterion | Default weight | What it measures |
+|-----------|---------------|-----------------|
+| **Semantic** | 0.7 | Cosine similarity to reference (sentence-transformers, ~80MB, runs on CPU) |
+| **Length** | 0.2 | Penalizes empty or trivially short responses |
+| **Brevity** | 0.1 | Rewards responses matching reference length |
+
+Customize weights with `--reward-weights "0.8,0.1,0.1"` to emphasize what matters for your domain.
+
+### Adaptive Temperature (Pivot vs Refine)
+
+The generator adapts its exploration strategy based on reward trends:
+- **Rewards improving** → decrease temperature (exploit / refine current direction)
+- **Rewards declining** → increase temperature (explore / pivot to different approach)
+- **Rewards flat** → maintain base temperature
+
+Inspired by [Anthropic's harness design research](https://www.anthropic.com/engineering/harness-design): "make a strategic decision — refine the current direction if scores are trending well, or pivot if the approach isn't working."
+
+### Evaluator Feedback Logging
+
+Each iteration logs the best and worst candidate per prompt with per-criterion breakdowns, making it easy to understand what the model is learning and where it struggles.
 
 ### Early Stopping
 

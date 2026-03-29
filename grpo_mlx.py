@@ -24,16 +24,30 @@ WHAT THIS SCRIPT SOLVES:
     Now Mac users can run the full fine-tuning pipeline locally:
     mlx-lm for CPT and SFT, this script for GRPO.
 
+ARCHITECTURE (Generator-Evaluator pattern):
+    This follows the same pattern described in Anthropic's harness design
+    research: separate the agent doing the work (generator) from the agent
+    judging it (evaluator). In our case:
+    - Generator: the LLM producing candidate responses
+    - Evaluator: the sentence-transformer encoder scoring them
+    The generator cannot reliably judge its own output quality — an
+    independent evaluator with concrete criteria produces better signal.
+
+    The evaluator uses multiple weighted criteria (not just one score),
+    and the generator adapts its exploration strategy based on reward
+    trends (more diversity when stuck, more exploitation when improving).
+
 HOW IT WORKS:
     1. Load any mlx-lm compatible model (optionally with SFT LoRA adapters)
     2. For each prompt, generate N candidate responses with sampling
-    3. Score each candidate using semantic similarity (sentence-transformers)
-       — the reference response from your dataset is the "gold standard"
+    3. Score each candidate on multiple criteria (semantic similarity,
+       response length, brevity) with configurable weights
     4. Compute GRPO loss: reward-weighted cross-entropy
        - Candidates better than the group average get reinforced
        - Candidates worse than the group average get penalized
-    5. Backpropagate through MLX and update LoRA weights
-    6. Repeat until convergence (automatic early stopping)
+    5. Adapt temperature based on reward trend (pivot vs refine)
+    6. Backpropagate through MLX and update LoRA weights
+    7. Repeat until convergence (automatic early stopping)
 
 Based on: "Shaping Explanations: Semantic Reward Modeling with Encoder-Only
 Transformers for GRPO" (arXiv:2509.13081)
@@ -125,36 +139,106 @@ def load_reference_data(data_path, min_response_length=80):
 
 
 # ============================================================================
-# Reward Computation
+# Multi-Criteria Reward System (Generator-Evaluator Pattern)
+# ============================================================================
+#
+# Inspired by Anthropic's harness design research: instead of a single score,
+# the evaluator grades on multiple criteria with configurable weights.
+# This produces a richer signal than cosine similarity alone.
+#
+# Default criteria:
+#   - semantic (weight 0.7): cosine similarity to reference — core signal
+#   - length (weight 0.2): penalizes empty/very short responses
+#   - brevity (weight 0.1): rewards concise responses matching reference length
+#
+# Users can adjust weights via --reward-weights "0.8,0.1,0.1" to emphasize
+# different aspects for their domain.
 # ============================================================================
 
 def compute_semantic_reward(generated, reference, encoder):
     """
-    Compute semantic similarity between generated and reference responses.
+    Criterion 1: Semantic similarity between generated and reference.
 
     Uses sentence-transformers to encode both texts into dense vectors,
     then computes cosine similarity as the reward signal.
-
-    Reward interpretation:
-        > 0.7  = response captures the right meaning
-        0.3-0.7 = partially correct
-        < 0.3  = off-topic or wrong language
-
-    Args:
-        generated: Candidate response text.
-        reference: Gold-standard response text.
-        encoder: SentenceTransformer model.
 
     Returns:
         Float between -1 and 1 (cosine similarity).
     """
     emb_gen = encoder.encode(generated)
     emb_ref = encoder.encode(reference)
-    # Cosine similarity with epsilon to avoid division by zero
     similarity = np.dot(emb_gen, emb_ref) / (
         np.linalg.norm(emb_gen) * np.linalg.norm(emb_ref) + 1e-8
     )
     return float(similarity)
+
+
+def compute_length_reward(generated, min_chars=10):
+    """
+    Criterion 2: Response length — penalizes empty or trivially short responses.
+
+    A response shorter than min_chars gets a score proportional to its length.
+    Anything at or above min_chars gets full score (1.0).
+
+    Returns:
+        Float between 0 and 1.
+    """
+    length = len(generated.strip())
+    if length >= min_chars:
+        return 1.0
+    return length / min_chars
+
+
+def compute_brevity_reward(generated, reference):
+    """
+    Criterion 3: Brevity — rewards responses close to reference length.
+
+    Penalizes responses that are much longer or shorter than the reference.
+    A response matching reference length exactly scores 1.0.
+    Doubling or halving the length scores ~0.5.
+
+    Returns:
+        Float between 0 and 1.
+    """
+    gen_len = max(len(generated.strip()), 1)
+    ref_len = max(len(reference.strip()), 1)
+    # Ratio-based: 1.0 when lengths match, decays as they diverge
+    ratio = gen_len / ref_len
+    return float(np.exp(-abs(np.log(ratio))))
+
+
+def compute_multi_criteria_reward(generated, reference, encoder, weights=(0.7, 0.2, 0.1)):
+    """
+    Combine multiple reward criteria into a single weighted score.
+
+    This follows the Generator-Evaluator pattern: the evaluator (this function)
+    grades the generator's output on multiple independent criteria, each
+    capturing a different aspect of response quality.
+
+    Args:
+        generated: Candidate response text.
+        reference: Gold-standard response text.
+        encoder: SentenceTransformer model for semantic similarity.
+        weights: Tuple of (semantic_weight, length_weight, brevity_weight).
+                 Must sum to 1.0.
+
+    Returns:
+        Dict with individual criterion scores and weighted total.
+    """
+    w_semantic, w_length, w_brevity = weights
+
+    semantic = compute_semantic_reward(generated, reference, encoder)
+    length = compute_length_reward(generated)
+    brevity = compute_brevity_reward(generated, reference)
+
+    total = (semantic * w_semantic) + (length * w_length) + (brevity * w_brevity)
+
+    return {
+        "semantic": semantic,
+        "length": length,
+        "brevity": brevity,
+        "total": total,
+    }
 
 
 # ============================================================================
@@ -180,7 +264,6 @@ def generate_candidate(model, tokenizer, prompt_text, max_tokens=256, temperatur
     Returns:
         Generated response text (without the prompt).
     """
-    # Recommended sampling parameters for instruct models
     sampler = make_sampler(temp=temperature, top_p=0.8, top_k=20)
     response = mlx_generate(
         model, tokenizer,
@@ -189,6 +272,57 @@ def generate_candidate(model, tokenizer, prompt_text, max_tokens=256, temperatur
         sampler=sampler,
     )
     return response
+
+
+# ============================================================================
+# Adaptive Temperature (Pivot vs Refine)
+# ============================================================================
+#
+# From Anthropic's harness research: the generator should "make a strategic
+# decision — refine the current direction if scores are trending well, or
+# pivot to an entirely different aesthetic if the approach wasn't working."
+#
+# Applied to GRPO: if rewards are declining, increase temperature to generate
+# more diverse candidates (explore / pivot). If rewards are improving,
+# decrease temperature to exploit what's working (refine).
+# ============================================================================
+
+def adapt_temperature(base_temp, reward_history, window=3):
+    """
+    Adjust generation temperature based on recent reward trend.
+
+    Looks at the last `window` iterations to decide:
+    - Improving (positive slope) → decrease temp slightly (exploit / refine)
+    - Declining (negative slope) → increase temp (explore / pivot)
+    - Flat → keep base temperature
+
+    Temperature is clamped between 0.3 (very focused) and 1.2 (very diverse).
+
+    Args:
+        base_temp: Starting temperature.
+        reward_history: List of average rewards per iteration.
+        window: Number of recent iterations to consider.
+
+    Returns:
+        Adjusted temperature.
+    """
+    if len(reward_history) < window:
+        return base_temp
+
+    recent = reward_history[-window:]
+    # Simple linear slope over the window
+    slope = (recent[-1] - recent[0]) / window
+
+    if slope > 0.02:
+        # Rewards improving → refine: reduce temp to exploit good direction
+        adjusted = base_temp * 0.9
+    elif slope < -0.02:
+        # Rewards declining → pivot: increase temp for more diversity
+        adjusted = base_temp * 1.15
+    else:
+        adjusted = base_temp
+
+    return float(np.clip(adjusted, 0.3, 1.2))
 
 
 # ============================================================================
@@ -287,10 +421,19 @@ def run_grpo(
     lora_layers=16,
     temperature=0.7,
     min_response_length=80,
+    reward_weights=(0.7, 0.2, 0.1),
     log_file=None,
 ):
     """
     Run the full GRPO training loop with weight updates.
+
+    Uses a Generator-Evaluator architecture:
+    - Generator: the LLM with LoRA, producing candidate responses
+    - Evaluator: sentence-transformer encoder scoring on multiple criteria
+
+    The evaluator is independent from the generator — it cannot be fooled
+    by the generator's confidence. This produces more reliable reward signal
+    than self-evaluation (see Anthropic's harness design research).
 
     Args:
         model_path: Path to MLX model or HuggingFace repo.
@@ -302,8 +445,9 @@ def run_grpo(
         max_tokens: Max response tokens.
         learning_rate: Adam LR (1e-6 is conservative and stable).
         lora_layers: Number of LoRA layers (16 for 9B on 64GB).
-        temperature: Generation temperature.
+        temperature: Base generation temperature.
         min_response_length: Filter threshold for reference data.
+        reward_weights: Tuple of (semantic, length, brevity) weights summing to 1.0.
         log_file: Optional log file path.
 
     Returns:
@@ -315,6 +459,8 @@ def run_grpo(
         log(f"SFT Adapter: {adapter_path}", log_file)
     log(f"Config: lr={learning_rate}, candidates={n_candidates}, "
         f"layers={lora_layers}, iters={n_iters}", log_file)
+    log(f"Reward weights: semantic={reward_weights[0]}, "
+        f"length={reward_weights[1]}, brevity={reward_weights[2]}", log_file)
 
     # Load the semantic reward encoder (lightweight, ~80MB)
     from sentence_transformers import SentenceTransformer
@@ -356,6 +502,8 @@ def run_grpo(
     results = {"iterations": [], "final_status": "running"}
     best_avg_reward = -1.0
     no_improve_count = 0
+    reward_history = []       # For adaptive temperature
+    current_temp = temperature  # Mutable temperature
 
     # ========================================================================
     # Training Loop
@@ -369,6 +517,7 @@ def run_grpo(
 
         iter_rewards = []
         iter_losses = []
+        iter_details = []  # Per-candidate detail for evaluator feedback
 
         for item in batch:
             # Build prompt with chat template (thinking DISABLED)
@@ -381,18 +530,29 @@ def run_grpo(
                 enable_thinking=False,  # CRITICAL — see docstring in generate_candidate
             )
 
-            # Generate N candidate responses
+            # Generate N candidate responses (temperature adapts based on trend)
             candidates = [
-                generate_candidate(model, tokenizer, prompt_text, max_tokens, temperature)
+                generate_candidate(model, tokenizer, prompt_text, max_tokens, current_temp)
                 for _ in range(n_candidates)
             ]
 
-            # Score each candidate against the reference
-            rewards = [
-                compute_semantic_reward(c, item["reference"], encoder)
+            # Multi-criteria evaluation: score each candidate on all criteria
+            candidate_evals = [
+                compute_multi_criteria_reward(c, item["reference"], encoder, reward_weights)
                 for c in candidates
             ]
+            # Extract total rewards for GRPO loss
+            rewards = [e["total"] for e in candidate_evals]
             iter_rewards.extend(rewards)
+
+            # Track best and worst candidate for evaluator feedback log
+            best_idx = int(np.argmax(rewards))
+            worst_idx = int(np.argmin(rewards))
+            iter_details.append({
+                "prompt": item["prompt"][:50],
+                "best": {"text": candidates[best_idx][:60], **candidate_evals[best_idx]},
+                "worst": {"text": candidates[worst_idx][:60], **candidate_evals[worst_idx]},
+            })
 
             # GRPO update: compute loss, get gradients, update LoRA weights
             model.train()
@@ -403,26 +563,44 @@ def run_grpo(
 
             iter_losses.append(loss.item())
 
-        # Log iteration metrics
+        # Compute iteration metrics
         avg_reward = float(np.mean(iter_rewards))
         max_reward = float(np.max(iter_rewards))
         avg_loss = float(np.mean(iter_losses))
         elapsed = time.time() - iter_start
+
+        # Adaptive temperature: pivot (explore) or refine (exploit)
+        reward_history.append(avg_reward)
+        current_temp = adapt_temperature(temperature, reward_history)
 
         results["iterations"].append({
             "iter": iteration + 1,
             "avg_reward": avg_reward,
             "max_reward": max_reward,
             "loss": avg_loss,
+            "temperature": current_temp,
             "time": elapsed,
         })
 
+        # Log iteration summary
         log(
             f"Iter {iteration+1}/{n_iters}: "
             f"reward={avg_reward:.3f} (max={max_reward:.3f}), "
-            f"loss={avg_loss:.4f}, {elapsed:.1f}s",
+            f"loss={avg_loss:.4f}, temp={current_temp:.2f}, {elapsed:.1f}s",
             log_file,
         )
+
+        # Log evaluator feedback: best and worst candidate per batch item
+        for detail in iter_details:
+            log(
+                f"  [{detail['prompt']}] "
+                f"best={detail['best']['total']:.3f} "
+                f"(sem={detail['best']['semantic']:.2f} "
+                f"len={detail['best']['length']:.2f} "
+                f"brv={detail['best']['brevity']:.2f}) "
+                f"worst={detail['worst']['total']:.3f}",
+                log_file,
+            )
 
         # Early stopping if reward plateaus
         if avg_reward > best_avg_reward + 0.01:
@@ -441,7 +619,7 @@ def run_grpo(
     log("\n=== Final Evaluation ===", log_file)
     final_rewards = []
 
-    for item in data[:min(5, len(data))]:
+    for item in data[:min(10, len(data))]:
         messages = [
             {"role": "system", "content": item["system"]},
             {"role": "user", "content": item["prompt"]},
@@ -452,12 +630,17 @@ def run_grpo(
         )
         # Use lower temperature for more deterministic evaluation
         candidate = generate_candidate(model, tokenizer, prompt_text, max_tokens, 0.3)
-        reward = compute_semantic_reward(candidate, item["reference"], encoder)
-        final_rewards.append(reward)
+        eval_result = compute_multi_criteria_reward(
+            candidate, item["reference"], encoder, reward_weights
+        )
+        final_rewards.append(eval_result["total"])
         log(f"  Q: {item['prompt'][:50]}...", log_file)
         log(f"  Gen: {candidate[:80]}...", log_file)
         log(f"  Ref: {item['reference'][:80]}...", log_file)
-        log(f"  Reward: {reward:.3f}", log_file)
+        log(f"  Score: total={eval_result['total']:.3f} "
+            f"(sem={eval_result['semantic']:.3f} "
+            f"len={eval_result['length']:.3f} "
+            f"brv={eval_result['brevity']:.3f})", log_file)
 
     avg_final = float(np.mean(final_rewards))
     results["final_avg_reward"] = avg_final
@@ -490,9 +673,9 @@ Examples:
     python grpo_mlx.py --model <any-mlx-model-path-or-repo> \\
         --adapter adapters/stage2-sft --data train.jsonl
 
-    # Custom parameters
+    # Custom reward weights (emphasize semantic similarity)
     python grpo_mlx.py --model <any-mlx-model-path-or-repo> \\
-        --data train.jsonl --n-candidates 6 --n-iters 50 --lr 5e-7
+        --data train.jsonl --reward-weights "0.8,0.1,0.1"
 
     # Without SFT adapter (GRPO directly on base/instruct model)
     python grpo_mlx.py --model <any-mlx-model-path-or-repo> \\
@@ -521,12 +704,20 @@ Authors: Roberto Marras, Claude Opus 4.6
     parser.add_argument("--lora-layers", type=int, default=16,
                         help="Number of LoRA layers (default: 16)")
     parser.add_argument("--temperature", type=float, default=0.7,
-                        help="Generation temperature (default: 0.7)")
+                        help="Base generation temperature (default: 0.7)")
     parser.add_argument("--min-response-length", type=int, default=80,
                         help="Min response chars to include (default: 80)")
+    parser.add_argument("--reward-weights", type=str, default="0.7,0.2,0.1",
+                        help="Reward weights: semantic,length,brevity (default: 0.7,0.2,0.1)")
     parser.add_argument("--log", default=None,
                         help="Log file path")
     args = parser.parse_args()
+
+    # Parse reward weights
+    weights = tuple(float(w) for w in args.reward_weights.split(","))
+    if len(weights) != 3 or abs(sum(weights) - 1.0) > 0.01:
+        print("ERROR: --reward-weights must be 3 comma-separated floats summing to 1.0")
+        sys.exit(1)
 
     results = run_grpo(
         model_path=args.model,
@@ -540,6 +731,7 @@ Authors: Roberto Marras, Claude Opus 4.6
         lora_layers=args.lora_layers,
         temperature=args.temperature,
         min_response_length=args.min_response_length,
+        reward_weights=weights,
         log_file=args.log,
     )
 
