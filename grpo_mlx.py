@@ -71,7 +71,7 @@ Dataset format (JSONL, same as SFT):
 Compatible with any model supported by mlx-lm (Qwen, Llama, Mistral,
 Gemma, Phi, etc.). Tested on Mac Mini M4 Pro 64GB with reward 0.922.
 
-Authors: Roberto Marras, Claude Opus 4.6
+Authors: onepixac, Claude Opus 4.6
 License: Apache 2.0
 """
 
@@ -682,7 +682,7 @@ Examples:
         --data train.jsonl
 
 Paper: arXiv:2509.13081
-Authors: Roberto Marras, Claude Opus 4.6
+Authors: onepixac, Claude Opus 4.6
         """,
     )
     parser.add_argument("--model", required=True,

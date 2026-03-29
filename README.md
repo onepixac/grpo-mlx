@@ -209,7 +209,7 @@ If you use this in your work:
 ```bibtex
 @software{grpo_mlx,
     title={GRPO on Apple Silicon (MLX)},
-    author={Roberto Marras and Claude Opus 4.6},
+    author={onepixac and Claude Opus 4.6},
     year={2025},
     url={https://github.com/onepixac/grpo-mlx}
 }
