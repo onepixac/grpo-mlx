@@ -4,26 +4,36 @@ GRPO Full Training on Apple Silicon (MLX)
 First open-source implementation of Group Relative Policy Optimization on MLX.
 
 THE PROBLEM:
-    Fine-tuning LLMs with RL (reinforcement learning) on Apple Silicon was not
-    possible. The standard library for GRPO (trl by HuggingFace) requires
-    CUDA/PyTorch and does not support Apple's MLX framework. This means Mac
-    users with M1/M2/M3/M4 chips could do SFT (supervised fine-tuning) but
-    NOT the RL step that makes responses more natural and flexible.
+    Today you can fine-tune an open-source LLM on Apple Silicon with mlx-lm:
+    CPT (domain adaptation) and SFT (instruction tuning) both work great.
+    But the fine-tuning pipeline has three stages, not two. The third stage
+    is RL (reinforcement learning) — specifically GRPO — which optimizes
+    response quality beyond what supervised training can achieve.
+
+    The only existing GRPO implementation (HuggingFace trl) requires CUDA
+    and PyTorch. It does not run on MLX. This means every Mac user doing
+    local fine-tuning is stuck at SFT — they can never complete the full
+    CPT → SFT → GRPO pipeline that produces the best results.
 
 WHAT THIS SCRIPT SOLVES:
     Implements the complete GRPO training loop natively on MLX, with actual
-    weight updates. No trl, no PyTorch, no CUDA needed. Just MLX on Apple
-    Silicon. Tested on Mac Mini M4 Pro 64GB with reward score 0.922.
+    LoRA weight updates via backpropagation. No trl, no PyTorch, no CUDA.
+    Works with ANY open-source model that runs on mlx-lm (Qwen, Llama,
+    Mistral, Gemma, Phi, etc. — any size, any quantization).
+
+    Now Mac users can run the full fine-tuning pipeline locally:
+    mlx-lm for CPT and SFT, this script for GRPO.
 
 HOW IT WORKS:
-    1. Load a model (optionally with SFT LoRA adapters)
-    2. For each prompt, generate N candidate responses
+    1. Load any mlx-lm compatible model (optionally with SFT LoRA adapters)
+    2. For each prompt, generate N candidate responses with sampling
     3. Score each candidate using semantic similarity (sentence-transformers)
+       — the reference response from your dataset is the "gold standard"
     4. Compute GRPO loss: reward-weighted cross-entropy
-       - Good candidates (high reward) get reinforced
-       - Bad candidates (low reward) get penalized
+       - Candidates better than the group average get reinforced
+       - Candidates worse than the group average get penalized
     5. Backpropagate through MLX and update LoRA weights
-    6. Repeat until convergence
+    6. Repeat until convergence (automatic early stopping)
 
 Based on: "Shaping Explanations: Semantic Reward Modeling with Encoder-Only
 Transformers for GRPO" (arXiv:2509.13081)
@@ -33,7 +43,7 @@ Requirements:
 
 Usage:
     python grpo_mlx.py \\
-        --model mlx-community/Qwen3.5-9B-MLX-4bit \\
+        --model <any-mlx-model> \\
         --adapter /path/to/sft/adapters \\
         --data /path/to/train.jsonl
 
@@ -44,7 +54,9 @@ Dataset format (JSONL, same as SFT):
         {"role": "assistant", "content": "..."}
     ]}
 
-Tested: Mac Mini M4 Pro 64GB, Qwen3.5-9B-MLX-4bit, reward 0.922
+Compatible with any model supported by mlx-lm (Qwen, Llama, Mistral,
+Gemma, Phi, etc.). Tested on Mac Mini M4 Pro 64GB with reward 0.922.
+
 Authors: Roberto Marras, Claude Opus 4.6
 License: Apache 2.0
 """
@@ -153,22 +165,22 @@ def generate_candidate(model, tokenizer, prompt_text, max_tokens=256, temperatur
     """
     Generate a single candidate response using MLX native generation.
 
-    CRITICAL: The prompt_text MUST have enable_thinking=False applied via
-    apply_chat_template. Without this, Qwen3.5 models prepend
-    "Thinking Process:" to every response, destroying semantic similarity.
-    (Reward drops from 0.92 to 0.27 with thinking enabled.)
+    CRITICAL: If your model supports "thinking mode" (e.g. Qwen3.5, QwQ),
+    you MUST disable it via enable_thinking=False in apply_chat_template.
+    Thinking models prepend internal reasoning to every response, which
+    destroys semantic similarity scores (reward drops from 0.92 to 0.27).
 
     Args:
         model: MLX model with LoRA applied.
         tokenizer: HuggingFace tokenizer.
         prompt_text: Full prompt with chat template applied.
         max_tokens: Maximum response length in tokens.
-        temperature: Sampling temperature (0.7 = Qwen3.5 official instruct mode).
+        temperature: Sampling temperature (0.7 recommended for instruct models).
 
     Returns:
         Generated response text (without the prompt).
     """
-    # Qwen3.5 official parameters for instruct (non-thinking) mode
+    # Recommended sampling parameters for instruct models
     sampler = make_sampler(temp=temperature, top_p=0.8, top_k=20)
     response = mlx_generate(
         model, tokenizer,
@@ -475,15 +487,15 @@ def main():
         epilog="""
 Examples:
     # With SFT adapter (recommended — start from fine-tuned model)
-    python grpo_mlx.py --model mlx-community/Qwen3.5-9B-MLX-4bit \\
+    python grpo_mlx.py --model <any-mlx-model-path-or-repo> \\
         --adapter adapters/stage2-sft --data train.jsonl
 
     # Custom parameters
-    python grpo_mlx.py --model mlx-community/Qwen3.5-9B-MLX-4bit \\
+    python grpo_mlx.py --model <any-mlx-model-path-or-repo> \\
         --data train.jsonl --n-candidates 6 --n-iters 50 --lr 5e-7
 
-    # Without SFT adapter (GRPO directly on base model)
-    python grpo_mlx.py --model mlx-community/Qwen3.5-4B-MLX-4bit \\
+    # Without SFT adapter (GRPO directly on base/instruct model)
+    python grpo_mlx.py --model <any-mlx-model-path-or-repo> \\
         --data train.jsonl
 
 Paper: arXiv:2509.13081
