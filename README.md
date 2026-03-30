@@ -202,6 +202,51 @@ Any model that works with `mlx-lm` works here. This includes MLX-converted model
 - [mlx-community](https://huggingface.co/mlx-community) on HuggingFace (thousands of models)
 - Models you convert yourself with `mlx_lm.convert`
 
+## Export to Production
+
+Models trained with MLX are saved in MLX format (4-bit quantized safetensors). **This format is not compatible with vLLM, transformers, TGI, or other standard inference frameworks.** To deploy your fine-tuned model in production, you need to export it.
+
+### Option 1: De-quantize to BF16
+
+```bash
+python -m mlx_lm fuse \
+    --model <your-mlx-model> \
+    --adapter-path adapters/stage3-grpo \
+    --save-path models/My-Model-BF16 \
+    --de-quantize
+```
+
+This produces a BF16 model in MLX format. Works for MLX inference but still not standard HuggingFace format.
+
+### Option 2: Export to HuggingFace format (recommended)
+
+```bash
+python -m mlx_lm fuse \
+    --model <original-hf-model> \
+    --adapter-path adapters/stage3-grpo \
+    --save-path models/My-Model-HF \
+    --export-format hf
+```
+
+This merges the LoRA adapters with the **original HuggingFace model** (not the MLX quantized version) and saves in standard transformers format. The output works everywhere: vLLM, transformers, TGI, GGUF conversion, etc.
+
+### Option 3: Upload LoRA adapters separately
+
+If your production setup supports LoRA loading (e.g., vLLM with `--enable-lora`), you can upload just the adapter files:
+
+```bash
+# Upload to HuggingFace
+huggingface-cli upload <your-org>/<model-name> adapters/stage3-grpo adapters/
+```
+
+The production server loads the base model and applies the LoRA adapters at runtime. Smallest upload size (~15-40 MB vs multi-GB full model).
+
+### Important
+
+- **Never upload MLX 4-bit fused models to HuggingFace** expecting them to work with standard frameworks — the MLX bit-packing format is incompatible
+- Always test the exported model before deploying
+- For FP8 quantization, use post-export tools like `llm-compressor` or `AutoFP8` (not supported natively by mlx-lm)
+
 ## Citation
 
 If you use this in your work:
