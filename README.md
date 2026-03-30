@@ -24,7 +24,7 @@ Based on: *"Shaping Explanations: Semantic Reward Modeling with Encoder-Only Tra
 
 ## Architecture: Generator-Evaluator Pattern
 
-This follows the same pattern described in [Anthropic's harness design research]([https://www.anthropic.com/engineering/harness-design](https://www.anthropic.com/engineering/harness-design-long-running-apps)): separate the agent doing the work (generator) from the agent judging it (evaluator).
+This follows the same pattern described in [Anthropic's harness design research]([https://www.anthropic.com/engineering/harness-design-long-running-apps](https://www.anthropic.com/engineering/harness-design-long-running-apps-long-running-apps)): separate the agent doing the work (generator) from the agent judging it (evaluator).
 
 - **Generator**: the LLM producing candidate responses via sampling
 - **Evaluator**: an independent sentence-transformer encoder scoring candidates on multiple criteria
@@ -186,7 +186,7 @@ The generator adapts its exploration strategy based on reward trends:
 - **Rewards declining** → increase temperature (explore / pivot to different approach)
 - **Rewards flat** → maintain base temperature
 
-Inspired by [Anthropic's harness design research](https://www.anthropic.com/engineering/harness-design): "make a strategic decision — refine the current direction if scores are trending well, or pivot if the approach isn't working."
+Inspired by [Anthropic's harness design research](https://www.anthropic.com/engineering/harness-design-long-running-apps): "make a strategic decision — refine the current direction if scores are trending well, or pivot if the approach isn't working."
 
 ### Evaluator Feedback Logging
 
